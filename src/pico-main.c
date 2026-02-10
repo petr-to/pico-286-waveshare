@@ -23,11 +23,14 @@
 #include "emulator/emulator.h"
 #include "audio.h"
 #include "graphics.h"
-#include "ps2.h"
+#ifdef KBDUSB
+    #include "usbhid.h"
+#else
+    #include "ps2.h"
+#endif
 #include "ff.h"
-#include "nespad.h"
+// #include "nespad.h"
 #include "emu8950.h"
-#include "ps2_mouse.h"
 
 #if HARDWARE_SOUND
 #include "74hc595/74hc595.h"
@@ -213,16 +216,66 @@ volatile bool ask_to_blast = false;
 void __time_critical_func() second_core(void) {
     // Initialize graphics subsystem
     graphics_init();
-    graphics_set_buffer((uint8_t *)VIDEORAM, 320, 200);
+    graphics_set_buffer((uint8_t *)VIDEORAM, 640, 480);
     graphics_set_textbuffer((uint8_t *)VIDEORAM + 32768*4);
     graphics_set_bgcolor(0);
     graphics_set_offset(0, 0);
     graphics_set_flashmode(true, true);
 
-    // Set initial VGA palette
-    for (uint8_t i = 0; i < 255; i++) {
+    // Set initial CGA palette for text mode
+    for (uint8_t i = 0; i < 16; i++) {
+        graphics_set_palette(i, cga_palette[i]);
+    }
+    for (uint8_t i = 16; i < 255; i++) {
         graphics_set_palette(i, vga_palette[i]);
     }
+    
+    // Set default video mode to 80x25 text (BIOS default)
+    // graphics_set_mode(TEXTMODE_80x25_COLOR);
+    // graphics_set_mode(TEXTMODE_80x25_BW);
+
+    // SPLASH SCREEN
+    videomode = VGA_320x200x256;
+    graphics_set_mode(videomode);
+    uint8_t *vram = (uint8_t *)VIDEORAM;
+    
+    // Draw blue gradient background
+    for (int y = 0; y < 200; y++) {
+        for (int x = 0; x < 320; x++) {
+            vram[y * 320 + x] = 32 + (y / 4); // Blue gradient in default VGA palette
+        }
+    }
+
+    // Draw "PICO 286" text
+    const char *splash_text = "PICO 286";
+    const int scale = 3;
+    const int text_len = 8;
+    const int start_x = (320 - (text_len * 8 * scale)) / 2;
+    const int start_y = (200 - (16 * scale)) / 2;
+
+    for (int i = 0; i < text_len; i++) {
+        char c = splash_text[i];
+        const uint8_t *glyph = &font_8x16[c * 16];
+        
+        for (int gy = 0; gy < 16; gy++) {
+            uint8_t row = glyph[gy];
+            for (int gx = 0; gx < 8; gx++) {
+                if (row & (1 << (7-gx))) {
+                    // Draw scaled pixel
+                    for (int sy = 0; sy < scale; sy++) {
+                        for (int sx = 0; sx < scale; sx++) {
+                            int px = start_x + (i * 8 * scale) + (gx * scale) + sx;
+                            int py = start_y + (gy * scale) + sy;
+                            if (px >= 0 && px < 320 && py >= 0 && py < 200) {
+                                vram[py * 320 + px] = 15; // White
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // END SPLASH SCREEN
 
     // Initialize sound hardware
 #if !HARDWARE_SOUND
@@ -667,7 +720,7 @@ int main(void) {
     vreg_disable_voltage_limit();
     vreg_set_voltage(vreg);
     flash_timings();
-    sleep_ms(100);
+    sleep_ms(10);  // Reduced from 100ms for faster boot
     if (!set_sys_clock_hz(cpu_mhz * MHZ, 0) ) {
         cpu_mhz = 378;
         set_sys_clock_hz(cpu_mhz * MHZ, 1); // fallback to failsafe clocks
@@ -685,15 +738,13 @@ int main(void) {
     gpio_init(PICO_DEFAULT_LED_PIN);
     gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
 
-    // LED startup sequence
-    for (int i = 0; i < 6; i++) {
-        sleep_ms(23);
+    // LED startup sequence (reduced for faster boot)
+    for (int i = 0; i < 2; i++) {
+        sleep_ms(10);
         gpio_put(PICO_DEFAULT_LED_PIN, true);
-        sleep_ms(23);
+        sleep_ms(10);
         gpio_put(PICO_DEFAULT_LED_PIN, false);
     }
-
-    sleep_ms(50);
 
 #if 0 // for future save settings in flash
     if (cmos[0] == 0) {
@@ -710,15 +761,15 @@ int main(void) {
         while (1);
     }
 
-    nespad_begin(NES_GPIO_CLK, NES_GPIO_DATA, NES_GPIO_LAT);
-    sleep_ms(5);
-    nespad_read();
+   // nespad_begin(NES_GPIO_CLK, NES_GPIO_DATA, NES_GPIO_LAT);
+   // sleep_ms(5);
+   // nespad_read();
 
-    if (nespad_state & DPAD_SELECT) {
-        // skip config
-    } else {
-        load_config_286();
-    }
+   // if (nespad_state & DPAD_SELECT) {
+    //    // skip config
+   // } else {
+   //     load_config_286();
+   // }
 
     // Initialize PSRAM
     rp2350a = (*((io_ro_32*)(SYSINFO_BASE + SYSINFO_PACKAGE_SEL_OFFSET)) & 1);
@@ -755,7 +806,17 @@ int main(void) {
         readdw86 = readdw86_ob;
     }
 
-    // Initialize peripherals
+    // Initialize semaphore and launch second core FIRST
+    // This ensures graphics are ready before keyboard can generate interrupts
+    sem_init(&vga_start_semaphore, 0, 1);
+    multicore_launch_core1(second_core);
+    sem_release(&vga_start_semaphore);
+    
+    // Small delay to let second core initialize (reduced for faster boot)
+    // Increased to show splash screen
+    sleep_ms(3000);
+    
+    // Initialize peripherals AFTER multicore is running
     keyboard_init();
 
     // Check for mouse availability
@@ -763,12 +824,7 @@ int main(void) {
     const uint8_t mouse_available = nespad_state;
     if (mouse_available)
 #endif
-        mouse_init();
-
-    // Initialize semaphore and launch second core
-    sem_init(&vga_start_semaphore, 0, 1);
-    multicore_launch_core1(second_core);
-    sem_release(&vga_start_semaphore);
+        // mouse_init();  // PS/2 mouse no longer used, using USB mouse instead
 
     if (new_cpu_mhz != cpu_mhz) {
         printf("Failed to overclock to %d MHz\n", new_cpu_mhz);
@@ -815,6 +871,12 @@ int main(void) {
 #if !PICO_RP2040
         if (delay) sleep_us(delay);
 #endif
+        
+#ifdef KBDUSB
+        // Poll USB HID keyboard
+        keyboard_tick();
+#endif
+
         // Handle gamepad input for mouse emulation
 #ifndef MURM2
         if (!mouse_available) {

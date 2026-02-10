@@ -57,13 +57,30 @@ extern "C" void _putchar(char character) {
 
 static inline void renderer() {
     static uint8_t v = 0;
+    static int render_count = 0;
+    
+    if (render_count == 0) {
+        printf("renderer: first call, videomode=0x%02x\n", videomode);
+    }
+    
     if (v != videomode) {
-        printf("videomode %x %x\n", videomode, v);
+        printf("videomode changed: 0x%02x -> 0x%02x\n", v, videomode);
         v = videomode;
     }
+    
+    render_count++;
 
-    uint8_t *vidramptr = VIDEORAM + 0x8000 + ((vram_offset & 0xffff) << 1);
+    uint8_t *vidramptr = (uint8_t*)VIDEORAM + 0x8000 + ((vram_offset & 0xffff) << 1);
     uint8_t cols = 80;
+    
+    // Debug: check if videoram has any data
+    static int debug_once = 1;
+    if (debug_once && render_count == 60) {
+        printf("VIDEORAM[0]=0x%08x, VIDEORAM[1]=0x%08x\n", VIDEORAM[0], VIDEORAM[1]);
+        printf("vidramptr[0]=0x%02x, vidramptr[1]=0x%02x\n", vidramptr[0], vidramptr[1]);
+        debug_once = 0;
+    }
+    
     for (int y = 0; y < 480; y++) {
         if (y >= 399)
             port3DA = 8;
@@ -82,11 +99,17 @@ static inline void renderer() {
                     uint16_t y_div_16 = y / 16; // Precompute y / 16
                     uint8_t glyph_line = (y / 2) % 8; // Precompute y % 8 for font lookup
                     // Calculate screen position
-                    uint8_t *text_buffer_line = vidramptr + y_div_16 * 80;
+                    // Use uint32_t pointer to match VRAM layout (1 word per address)
+                    uint32_t *text_buffer_line = VIDEORAM + 0x8000 + ((vram_offset & 0xffff) << 1) + y_div_16 * 80;
 
                     for (int column = 0; column < 40; column++) {
-                        uint8_t glyph_pixels = font_8x8[*text_buffer_line++ * 8 + glyph_line]; // Glyph row from font
-                        uint8_t color = *text_buffer_line++; // Color attribute
+                        uint32_t char_word = *text_buffer_line++;
+                        uint32_t attr_word = *text_buffer_line++;
+                        
+                        uint8_t char_code = char_word & 0xFF;
+                        uint8_t color = attr_word & 0xFF;
+                        
+                        uint8_t glyph_pixels = font_8x8[char_code * 8 + glyph_line]; // Glyph row from font
 
                         // Cursor blinking check
                         uint8_t cursor_active = cursor_blink_state &&
@@ -118,12 +141,18 @@ static inline void renderer() {
                     uint8_t glyph_line = y % 16; // Precompute y % 8 for font lookup
 
                     // Calculate screen position
-                    uint8_t *text_row = vidramptr + y_div_16 * 160;
+                    // Use uint32_t pointer to match VRAM layout (1 word per address)
+                    uint32_t *text_row = VIDEORAM + 0x8000 + ((vram_offset & 0xffff) << 1) + y_div_16 * 160;
+                    
                     for (uint8_t column = 0; column < 80; column++) {
                         // Access vidram and font data once per character
-                        uint8_t *charcode = text_row + column * 2; // Character code
-                        uint8_t glyph_row = font_8x16[*charcode * 16 + glyph_line]; // Glyph row from font
-                        uint8_t color = *++charcode; // Color attribute
+                        uint32_t *charcode = text_row + column * 2; // Character code
+                        
+                        uint32_t char_val = *charcode;
+                        uint8_t glyph_row = font_8x16[(char_val & 0xFF) * 16 + glyph_line]; // Glyph row from font
+                        
+                        uint32_t attr_val = *++charcode; // Color attribute
+                        uint8_t color = attr_val & 0xFF;
 
                         // Cursor blinking check
                         uint8_t cursor_active =
@@ -181,11 +210,13 @@ static inline void renderer() {
                     break;
                 }
                 case 0x06: {
-                    uint8_t *cga_row = vidramptr + (y / 2 >> 1) * 80 + (y / 2 & 1) * 8192; // Precompute row start
+                    // Use uint32_t pointer and word offsets
+                    uint32_t *cga_row = VIDEORAM + 0x8000 + ((vram_offset & 0xffff) << 1) + (y / 2 >> 1) * 80 + (y / 2 & 1) * 8192;
 
                     // Each byte containing 8 pixels
                     for (int x = 640 / 8; x--;) {
-                        uint8_t cga_byte = *cga_row++;
+                        uint32_t cga_byte_val = *cga_row++;
+                        uint8_t cga_byte = cga_byte_val & 0xFF;
 
                         *pixels++ = cga_palette[(cga_byte >> 7 & 1) * cga_foreground_color];
                         *pixels++ = cga_palette[(cga_byte >> 6 & 1) * cga_foreground_color];
@@ -204,7 +235,7 @@ static inline void renderer() {
                     vram_offset = 5;
                     if (y >= 348) break;
                 case 0x7: {
-                    uint8_t *cga_row = vram_offset + VIDEORAM + (y & 3) * 8192 + y / 4 * cols;
+                    uint8_t *cga_row = vram_offset + (uint8_t*)VIDEORAM + (y & 3) * 8192 + y / 4 * cols;
                     // Each byte containing 8 pixels
                     for (int x = 640 / 8; x--;) {
                         uint8_t cga_byte = *cga_row++;
@@ -238,11 +269,14 @@ static inline void renderer() {
                             break;
                     }
 
-                    uint8_t *cga_row = tga_offset + VIDEORAM + (y / 2 >> 1) * 80 + (y / 2 & 1) * 8192; // Precompute row start
+                    // Use uint32_t pointer and correct tga_offset
+                    uint32_t *cga_row = VIDEORAM + tga_offset + (y / 2 >> 1) * 80 + (y / 2 & 1) * 8192; 
 
                     // Each byte containing 8 pixels
-                    for (int x = 640 / 8; x--;) {
-                        uint8_t cga_byte = *cga_row++; // Fetch 8 pixels from TGA memory
+                    for (int x = 640 / 8; x--;) {    
+                        uint32_t cga_byte_val = *cga_row++; // Fetch 8 pixels from TGA memory
+                        uint8_t cga_byte = cga_byte_val & 0xFF;
+                        
                         uint8_t color1 = cga_byte >> 4 & 15;
                         uint8_t color2 = cga_byte & 15;
 
@@ -256,23 +290,34 @@ static inline void renderer() {
                     break;
                 }
                 case 0x09: /* tandy 320x200 16 color */ {
-                    uint8_t *tga_row = tga_offset + VIDEORAM + (y / 2 & 3) * 8192 + y / 8 * 160;
-                    //                  uint8_t *tga_row = &VIDEORAM[tga_offset+(((y / 2) & 3) * 8192) + ((y / 8) * 160)];
+                    // Use uint32_t pointer
+                    uint32_t *tga_row = VIDEORAM + tga_offset + (y / 2 & 3) * 8192 + y / 8 * 160;
 
                     // Each byte containing 4 pixels
                     for (int x = 320 / 2; x--;) {
-                        uint8_t tga_byte = *tga_row++;
+                        uint32_t tga_byte_val = *tga_row++;
+                        uint8_t tga_byte = tga_byte_val & 0xFF;
+                        
                         *pixels++ = *pixels++ = tga_palette[tga_palette_map[tga_byte >> 4 & 15]];
                         *pixels++ = *pixels++ = tga_palette[tga_palette_map[tga_byte & 15]];
                     }
                     break;
                 }
                 case 0x0a: /* tandy 640x200 16 color */ {
-                    uint8_t *tga_row = VIDEORAM + y / 2 * 320;
+                    // Use uint32_t pointer, note: this mode typically starts at B8000, 
+                    // ensure offset logic matches. tga_offset usually handles bank switching for Tandy.
+                    // Assuming flat mapping relative to tga_offset or 0x8000 if not set.
+                    // Safe guess based on other modes: use 0x8000 + offset if tga_offset is not used?
+                    // Previous code was VIDEORAM + (y/2)*320. If that meant 0 offset, it accessed A0000.
+                    // If A0000 is used for this mode, fine. If not, it might need 0x8000.
+                    // Let's stick to simple type fix for now to match the pattern.
+                    uint32_t *tga_row = VIDEORAM + y / 2 * 320; 
 
                     // Each byte contains 2 pixels
                     for (int x = 640 / 2; x--;) {
-                        uint8_t tga_byte = *tga_row++;
+                        uint32_t tga_byte_val = *tga_row++;
+                        uint8_t tga_byte = tga_byte_val & 0xFF;
+                        
                         *pixels++ = tga_palette[tga_palette_map[tga_byte >> 4 & 15]];
                         *pixels++ = tga_palette[tga_palette_map[tga_byte & 15]];
                     }
@@ -341,7 +386,7 @@ static inline void renderer() {
                     break;
                 }
                 case 0x11: /* VGA 640x480 2-color */ {
-                    uint8_t *cga_row = (uint8_t *) (VIDEORAM + y * 80);
+                    uint8_t *cga_row = (uint8_t*)VIDEORAM + y * 80;
                     // Each byte containing 8 pixels
                     for (int x = 640 / 8; x--;) {
                         uint8_t cga_byte = *cga_row++;
@@ -388,9 +433,11 @@ static inline void renderer() {
                             *pixels++ = *pixels++ = color;
                         }
                     } else {
-                        uint8_t *vga_row = VIDEORAM + (y >> 1) * 320;
+                        // Standard chain-4 mode
+                        uint32_t *vga_row = VIDEORAM + (y >> 1) * 320;
                         for (int x = 0; x < 320; x++) {
-                            uint32_t color = vga_palette[*vga_row++];
+                            uint32_t val = *vga_row++;
+                            uint32_t color = vga_palette[val & 0xFF];
                             *pixels++ = *pixels++ = color;
                         }
                     }
@@ -403,12 +450,17 @@ static inline void renderer() {
                     uint16_t y_div_4 = y / 4; // Precompute y / 4
                     uint8_t odd_even = y / 2 & 1;
                     // Calculate screen position
-                    uint8_t *cga_row = VIDEORAM + 0x8000 + y_div_4 * 160;
+                    // Use uint32_t pointer
+                    uint32_t *cga_row = VIDEORAM + 0x8000 + ((vram_offset & 0xffff) << 1) + y_div_4 * 160;
+                    
                     for (uint8_t column = 0; column < cols; column++) {
                         // Access vidram and font data once per character
-                        uint8_t *charcode = cga_row + column * 2; // Character code
-                        uint8_t glyph_row = font_8x8[*charcode * 8 + odd_even]; // Glyph row from font
-                        uint8_t color = *++charcode;
+                        uint32_t *charcode = cga_row + column * 2; // Character code
+                        uint32_t char_val = *charcode;
+                        uint32_t attr_val = *++charcode;
+                        
+                        uint8_t glyph_row = font_8x8[(char_val & 0xFF) * 8 + odd_even]; // Glyph row from font
+                        uint8_t color = attr_val & 0xFF;
 
 #pragma GCC unroll(8)
                         for (uint8_t bit = 0; bit < 8; bit++) {
@@ -420,12 +472,18 @@ static inline void renderer() {
                 case 0x79: /* 80x200x16 textmode */ {
                     int y_div_2 = y / 2; // Precompute y / 2
                     // Calculate screen position
-                    uint8_t *cga_row = VIDEORAM + 0x8000 + y_div_2 * 80 + (y_div_2 & 1 * 8192);
+                    // Use uint32_t pointer
+                    uint32_t *cga_row = VIDEORAM + 0x8000 + ((vram_offset & 0xffff) << 1) + y_div_2 * 80 + (y_div_2 & 1 * 8192);
+
                     for (int column = 0; column < 40; column++) {
                         // Access vidram and font data once per character
-                        uint8_t *charcode = cga_row + column * 2; // Character code
-                        uint8_t glyph_row = font_8x8[*charcode * 8]; // Glyph row from font
-                        uint8_t color = *++charcode;
+                        uint32_t *charcode = cga_row + column * 2; // Character code
+                        
+                        uint32_t char_val = *charcode;
+                        uint32_t attr_val = *++charcode;
+                        
+                        uint8_t glyph_row = font_8x8[(char_val & 0xFF) * 8]; // Glyph row from font
+                        uint8_t color = attr_val & 0xFF;
 
 #pragma GCC unroll(8)
                         for (int bit = 0; bit < 8; bit++) {
@@ -438,12 +496,18 @@ static inline void renderer() {
                     /* 40x46 ??? */
                     int y_div_2 = y / 8; // Precompute y / 2
                     // Calculate screen position
-                    uint8_t *cga_row = VIDEORAM + 0x8000 + y_div_2 * 80 + (y_div_2 & 1 * 8192);
+                    // Use uint32_t pointer
+                    uint32_t *cga_row = VIDEORAM + 0x8000 + ((vram_offset & 0xffff) << 1) + y_div_2 * 80 + (y_div_2 & 1 * 8192);
+                    
                     for (int column = 0; column < 40; column++) {
                         // Access vidram and font data once per character
-                        uint8_t *charcode = cga_row + column * 2; // Character code
-                        uint8_t glyph_row = font_8x8[*charcode * 8 + (y_div_2 % 8)]; // Glyph row from font
-                        uint8_t color = *++charcode;
+                        uint32_t *charcode = cga_row + column * 2; // Character code
+                        
+                        uint32_t char_val = *charcode;
+                        uint32_t attr_val = *++charcode;
+                        
+                        uint8_t glyph_row = font_8x8[(char_val & 0xFF) * 8 + (y_div_2 % 8)]; // Glyph row from font
+                        uint8_t color = attr_val & 0xFF;
 
 #pragma GCC unroll(8)
                         for (int bit = 0; bit < 8; bit++) {
@@ -462,13 +526,13 @@ static inline void renderer() {
             uint8_t glyph_line = ydebug % 8;
 
             const uint8_t colors[4] = {0x0f, 0xf0, 10, 12};
-            //указатель откуда начать считывать символы
+            // Pointer to character data
             uint8_t *text_buffer_line = &DEBUG_VRAM[y_div_8 * 80];
             for (uint8_t column = 80; column--;) {
                 const uint8_t character = *text_buffer_line++;
                 const uint8_t color = colors[character >> 6];
                 uint8_t glyph_pixels = font_8x8[(32 + (character & 63)) * 8 + glyph_line];
-                //считываем из быстрой палитры начало таблицы быстрого преобразования 2-битных комбинаций цветов пикселей
+                // Read from fast palette lookup table for 2-bit color combinations
                 // Unrolled bit loop: Write 8 pixels with scaling (2x horizontally)
                 for (int bit = 0; bit < 8; bit++) {
                     *pixels++ = cga_palette[glyph_pixels >> bit & 1 ? color & 0x0f : color >> 4];
@@ -565,37 +629,37 @@ extern "C" void HandleInput(unsigned int keycode, int isKeyDown) {
             break; // Backspace
         case 9: scancode = 0x0F;
             break; // Tab
-        case 37: scancode = 0x4B;
+        case 1000: scancode = 0x4B;
             break; // Left
-        case 38: scancode = 0x48;
+        case 1001: scancode = 0x48;
             break; // Up
-        case 39: scancode = 0x4D;
+        case 1002: scancode = 0x4D;
             break; // Right
-        case 40: scancode = 0x50;
+        case 1003: scancode = 0x50;
             break; // Down
-        case 112: scancode = 0x3B;
+        case 1004: scancode = 0x3B;
             break; // F1
-        case 113: scancode = 0x3C;
+        case 1005: scancode = 0x3C;
             break; // F2
-        case 114: scancode = 0x3D;
+        case 1006: scancode = 0x3D;
             break; // F3
-        case 115: scancode = 0x3E;
+        case 1007: scancode = 0x3E;
             break; // F4
-        case 116: scancode = 0x3F;
+        case 1008: scancode = 0x3F;
             break; // F5
-        case 117: scancode = 0x40;
+        case 1009: scancode = 0x40;
             break; // F6
-        case 118: scancode = 0x41;
+        case 1010: scancode = 0x41;
             break; // F7
-        case 119: scancode = 0x42;
+        case 1011: scancode = 0x42;
             break; // F8
-        case 120: scancode = 0x43;
+        case 1012: scancode = 0x43;
             break; // F9
-        case 121: scancode = 0x44;
+        case 1013: scancode = 0x44;
             break; // F10
-        case 122: scancode = 0x57;
+        case 1014: scancode = 0x57;
             break; // F11
-        case 123: scancode = 0x58;
+        case 1015: scancode = 0x58;
             break; // F12
         case 16: scancode = 0x2A;
             break; // Shift
@@ -603,6 +667,42 @@ extern "C" void HandleInput(unsigned int keycode, int isKeyDown) {
             break; // Ctrl
         case 18: scancode = 0x38;
             break; // Alt
+        
+        // Punctuation
+        case 59: // ;
+        case 58: // :
+            scancode = 0x27; break;
+        case 39: // '
+        case 34: // "
+            scancode = 0x28; break;
+        case 44: // ,
+        case 60: // <
+            scancode = 0x33; break;
+        case 46: // .
+        case 62: // >
+            scancode = 0x34; break;
+        case 47: // /
+        case 63: // ?
+            scancode = 0x35; break;
+        case 91: // [
+        case 123: // {
+            scancode = 0x1A; break;
+        case 93: // ]
+        case 125: // }
+            scancode = 0x1B; break;
+        case 45: // -
+        case 95: // _
+            scancode = 0x0C; break;
+        case 61: // =
+        case 43: // +
+            scancode = 0x0D; break;
+        case 92: // \
+        case 124: // |
+            scancode = 0x2B; break;
+        case 96: // `
+        case 126: // ~
+            scancode = 0x29; break;
+
         default: scancode = 0;
             break;
     }
@@ -746,16 +846,45 @@ int main() {
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
 
+    printf("Opening window...\n");
+    fflush(stdout);
+    
     if (!mfb_open("Pico-286 Emulator", 640, 480, 1)) {
         printf("Failed to open window\n");
         return -1;
     }
+    
+    printf("Window opened successfully!\n");
+    fflush(stdout);
 
-    memset(SCREEN, 0, sizeof(SCREEN));
+    // Initialize memory access functions (required before reset86!)
+    write86 = write86_ob;
+    writew86 = writew86_ob;
+    writedw86 = writedw86_ob;
+    read86 = read86_ob;
+    readw86 = readw86_ob;
+    readdw86 = readdw86_ob;
+
+    // Test: fill screen with blue to verify rendering works
+    for (int i = 0; i < 640 * 480; i++) {
+        SCREEN[i] = 0x0000FF;  // Blue
+    }
+    
     emu8950_opl = OPL_new(3579552, SOUND_FREQUENCY);
     blaster_reset();
     sn76489_reset();
     reset86();
+    
+    // Test: Write some text to video RAM after reset
+    // Video RAM starts at offset 0xB8000 - 0xA0000 = 0x18000 bytes into VIDEORAM
+    // For text mode 80x25, we write character + attribute pairs
+    uint8_t *textram = (uint8_t*)VIDEORAM + 0x18000; // 0xB8000 area
+    const char *test_msg = "HELLO FROM EMULATOR!";
+    for (int i = 0; test_msg[i]; i++) {
+        textram[i * 2] = test_msg[i];      // Character
+        textram[i * 2 + 1] = 0x0F;         // White on black
+    }
+    printf("Test text written to VIDEORAM at offset 0x18000\n");
 
     // Initialize audio system
     if (linux_audio_init(SOUND_FREQUENCY, 2, AUDIO_BUFFER_LENGTH) == 0) {
@@ -772,11 +901,28 @@ int main() {
     pthread_create(&sound_tid, NULL, sound_thread, NULL);
     pthread_create(&ticks_tid, NULL, ticks_thread, NULL);
 
+    printf("Starting main loop...\n");
+    fflush(stdout);
+    
+    int frame_count = 0;
     while (running) {
         exec86(32768);  // Reduced from 32768 to allow more frequent audio updates
+        
+        if (frame_count == 0) {
+            printf("First mfb_update call...\n");
+            fflush(stdout);
+        }
+        
         if (mfb_update(SCREEN, 0) < 0) {
+            printf("mfb_update failed, exiting\n");
             running = 0;
             break;
+        }
+        
+        frame_count++;
+        if (frame_count == 60) {
+            printf("60 frames rendered\n");
+            fflush(stdout);
         }
     }
 

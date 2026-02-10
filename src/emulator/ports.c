@@ -5,7 +5,7 @@
 #include <74hc595.h>
 #include <hardware/pwm.h>
 extern int16_t keyboard_send(uint8_t data);
-#include "nespad.h"
+// #include "nespad.h"
 #endif
 
 #include <emu8950.h>
@@ -36,7 +36,7 @@ static INLINE void joystick_out() {
 
 static INLINE uint8_t joystick_in() {
     uint8_t data = 0xF0;
-#if PICO_ON_DEVICE
+#if PICO_ON_DEVICE_NESPAD
     nespad_read();
     int8_t axis_x = nespad_state & DPAD_LEFT ? -127 : (nespad_state & DPAD_RIGHT) ? 127 : 0;
     int8_t axis_y = nespad_state & DPAD_UP ? -127 : (nespad_state & DPAD_DOWN) ? 127 : 0;
@@ -546,7 +546,11 @@ void get_sound_sample(const int16_t other_sample, int16_t *samples) {
     const int32_t sample = (speaker_sample() + other_sample + covox_sample + midi_sample());
     pwm_set_gpio_level(PCM_PIN, (uint16_t) ((int32_t) sample + 0x8000L) >> 4);
 #else
-    OPL_calc_buffer_linear(emu8950_opl, (int32_t *)samples, 1);
+    if (emu8950_opl) {
+        OPL_calc_buffer_linear(emu8950_opl, (int32_t *)samples, 1);
+    } else {
+        samples[0] = samples[1] = 0;
+    }
 
     samples[1] = samples[0] += (int32_t)(speaker_sample() + other_sample + covox_sample + sn76489_sample() + midi_sample());
     cms_samples(samples);

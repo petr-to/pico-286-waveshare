@@ -7,50 +7,46 @@
 #include "emulator/emulator.h"
 #include "graphics.h"
 
-//PIO параметры
+// PIO parameters
 static uint pio_program_offset_video = 0;
 static uint pio_program_offset_converter = 0;
 
-//SM
+// State machines
 static int sm_video_output = -1;
 static int sm_address_converter = -1;
 
-//активный видеорежим
+// Active video mode
 static enum graphics_mode_t graphics_mode = TEXTMODE_80x25_COLOR;
 
-//графический буфер
+// Graphics framebuffer
 static uint8_t *graphics_framebuffer = NULL;
 static int framebuffer_width = 0;
 static int framebuffer_height = 0;
 static int framebuffer_offset_x = 0;
 static int framebuffer_offset_y = 0;
 
-//текстовый буфер
+// Text buffer
 uint8_t *text_buffer = NULL;
 
-
-//DMA каналы
-//каналы работы с первичным графическим буфером
+// DMA channels for primary graphics buffer
 static int dma_channel_control;
 static int dma_channel_data;
-//каналы работы с конвертацией палитры
+
+// DMA channels for palette conversion
 static int dma_channel_palette_control;
 static int dma_channel_palette_data;
 
-//DMA буферы
-//основные строчные данные
+// Scanline buffers
 static uint32_t *scanline_buffers[2] = { NULL,NULL };
 static uint32_t *dma_buffer_addresses[2];
 
-//ДМА палитра для конвертации
-//в хвосте этой памяти выделяется dma_data
-static alignas(4096) uint32_t tmds_palette_buffer[1224];
+// DMA palette buffer for conversion (dma_data allocated at the end)
+static alignas(4096) uint32_t tmds_palette_buffer[2256];
 
-
-//индекс, проверяющий зависание
+// Interrupt counter for hang detection
 static uint32_t interrupt_counter = 0;
 
-//функции и константы HDMI
+// HDMI control constants
 #define HDMI_CTRL_BASE_INDEX (251)
 
 extern int cursor_blink_state;
@@ -164,8 +160,19 @@ static uint tmds_encode_8b10b(const uint8_t input_byte) {
         previous_bit = encoded_bit;
     }
 
-    // Add control bits (bits 8 and 9)
-    encoded_data |= use_xnor ? 1 << 9 : 1 << 8;
+    // Stage 2: DC Balancing (Simplified for "Symbol + Inverse" transmission)
+    // We assume disparity is 0.
+    // If q_m[8] == 0 (use_xnor):
+    //   q_out[9] = 1, q_out[8] = 0, q_out[0-7] = ~q_m[0-7]
+    // If q_m[8] == 1 (!use_xnor):
+    //   q_out[9] = 0, q_out[8] = 1, q_out[0-7] = q_m[0-7]
+
+    if (use_xnor) {
+        encoded_data ^= 0xFF; // Invert data bits
+        encoded_data |= (1 << 9); // Set Bit 9
+    } else {
+        encoded_data |= (1 << 8); // Set Bit 8
+    }
 
     return encoded_data;
 }
@@ -209,96 +216,196 @@ static void __time_critical_func() hdmi_scanline_interrupt_handler() {
     // Acknowledge DMA interrupt
     dma_hw->ints0 = 1u << dma_channel_control;
 
-    // Set up the next scanline buffer
-    dma_channel_set_read_addr(dma_channel_control, &dma_buffer_addresses[buffer_index], false);
-
     current_scanline = current_scanline >= 524 ? 0 : (current_scanline + 1);
 
     const bool odd_scanline = current_scanline & 1;
-    // VSync
-    port3DA = (current_scanline >= 399 ? 8 : 0) | odd_scanline;
+    
+    // VSync timing: 640x480@60Hz = lines 490-491 (480 active + 10 front porch)
+    port3DA = (current_scanline >= 490 ? 8 : 0) | odd_scanline; 
 
-    // Skip processing on even scanlines (simple line doubling for 240p output)
-    if (!odd_scanline) return;
+    const bool is_640x400_mode = (graphics_mode == TEXTMODE_80x25_COLOR ||
+                                  graphics_mode == TEXTMODE_80x25_BW);
 
+    // Line doubling logic
+    // We are preparing for the NEXT scanline (current_scanline + 1)
+    // If is_640x400_mode: Always generate new data
+    // If 320x200 mode:
+    //   If current is Odd (1), Next is Even (2). Even lines are NEW. -> Generate.
+    //   If current is Even (2), Next is Odd (3). Odd lines are REPEAT. -> Reuse.
+    
+    bool generate_new_line = false;
+    if (is_640x400_mode) {
+        generate_new_line = true;
+    } else {
+        if (odd_scanline) {
+            generate_new_line = false; // Odd line -> Repeat
+        } else {
+            generate_new_line = true;  // Even line -> New
+        }
+    }
+
+    if (!generate_new_line) {
+        // Reuse current buffer for next scanline
+        dma_channel_set_read_addr(dma_channel_control, &dma_buffer_addresses[buffer_index], false);
+        return;
+    }
+
+    // Switch buffer for new data
     buffer_index ^= 1;
+    dma_channel_set_read_addr(dma_channel_control, &dma_buffer_addresses[buffer_index], false);
 
-    uint8_t *current_scanline_buffer = (uint8_t *) scanline_buffers[buffer_index];
+    uint8_t *current_scanline_buffer = (uint8_t *)scanline_buffers[buffer_index];
 
-    if (graphics_framebuffer && current_scanline < 400) {
-        //область изображения
-        uint8_t *output_buffer = current_scanline_buffer + 72; //для выравнивания синхры;
-        const uint8_t y = current_scanline / 2;
+    if (graphics_framebuffer && current_scanline < 480) {
+
+        // Buffer offset: Front (16) + Sync (96) + Back (48) = 160
+        const uint16_t buffer_offset = 160; // Same for all modes to maintain VGA timing
+        uint8_t *output_buffer = current_scanline_buffer + buffer_offset;
+    
+        // Text mode 80x25: 400 lines (25*16) centered on 480, offset 40 lines, no line doubling
+        // Graphics modes 320x200: 400 lines (200*2 line doubling) centered on 480, offset 40 lines
+        const bool in_text_area = (current_scanline >= 40 && current_scanline < 440);
+        const uint16_t y_raw = in_text_area ? current_scanline - 40 : 0;
+        // For text mode use y_raw directly (0-399), for graphics mode y_raw/2 (0-199 with line doubling)
+        const uint16_t y = is_640x400_mode ? y_raw : (y_raw / 2);
 
         switch (graphics_mode) {
-            case TEXTMODE_80x25_COLOR: {
-                const uint8_t y_div_6 = y / 6;
-                const uint8_t glyph_line = y - y_div_6 * 6; // Optimized modulo
-                const uint32_t *text_buffer_line = &VIDEORAM[0x8000 + (vram_offset << 1) + __fast_mul(y_div_6, 160)];
-
+            
+            case TEXTMODE_80x25_BW: {
+                if (!in_text_area) {
+                    memset(output_buffer, 0, 640);
+                    break;
+                }
+                const uint8_t y_div_16 = y >> 4;           // 0-24 for 25 rows
+                const uint8_t glyph_line = y & 15;         // 0-15 within glyph
+                
+                const uint32_t *text_buffer_line = &VIDEORAM[0x8000 + (vram_offset << 1) + 
+                                                            __fast_mul(y_div_16, 160)];
+                
                 for (unsigned int column = 0; column < TEXTMODE_COLS; column++) {
-                    uint8_t glyph_pixels = font_4x6[__fast_mul(*text_buffer_line++ & 0xFF, 6) + glyph_line];
-                    const uint8_t color = *text_buffer_line++; // TODO: cga_blinking
-
+                    uint8_t glyph_pixels = font_8x16[__fast_mul(*text_buffer_line++ & 0xFF, 16) + glyph_line];
+                    const uint8_t color = *text_buffer_line++;
+                    
+                    // Blink handling
                     if (color & 0x80 && cursor_blink_state) {
                         glyph_pixels = 0;
                     }
-
-                    // TODO: Actual cursor size
+                    
+                    // Cursor rendering
                     const uint8_t cursor_active = cursor_blink_state &&
-                                                  y_div_6 == CURSOR_Y && column == CURSOR_X &&
-                                                  glyph_line >= 4;
-
+                        y_div_16 == CURSOR_Y && column == CURSOR_X &&
+                        glyph_line >= 14;  // Cursor on bottom 2 lines
+                    
                     if (cursor_active) {
-                        *output_buffer++ = textmode_palette[color & 0xf];
-                        *output_buffer++ = textmode_palette[color & 0xf];
-                        *output_buffer++ = textmode_palette[color & 0xf];
-                        *output_buffer++ = textmode_palette[color & 0xf];
-                    } else if (cga_blinking && color >> 7 & 1) {
-#pragma GCC unroll(4)
-                        for (int bit = 4; bit--;) {
-                            *output_buffer++ = cursor_blink_state
-                                                   ? color >> 4 & 0x7
-                                                   : glyph_pixels & 1
-                                                         ? textmode_palette[color & 0xf] //цвет шрифта
-                                                         : textmode_palette[color >> 4 & 0x7]; //цвет фона
-
+                        const uint8_t cursor_color = textmode_palette[color & 0xf];
+                        #pragma GCC unroll(8)
+                        for (int i = 0; i < 8; i++) {
+                            *output_buffer++ = cursor_color;
+                        }
+                    } else if (cga_blinking && (color & 0x80)) {
+                        const uint8_t fg = textmode_palette[color & 0xf];
+                        const uint8_t bg = textmode_palette[color >> 4 & 0x7];
+                        #pragma GCC unroll(8)
+                        for (int bit = 8; bit--;) {
+                            *output_buffer++ = cursor_blink_state ? bg 
+                                : (glyph_pixels & 1) ? fg : bg;
                             glyph_pixels >>= 1;
                         }
                     } else {
-#pragma GCC unroll(4)
-                        for (int bit = 4; bit--;) {
-                            *output_buffer++ = glyph_pixels & 1
-                                                   ? textmode_palette[color & 0xf] //цвет шрифта
-                                                   : textmode_palette[color >> 4]; //цвет фона
-
+                        const uint8_t fg = textmode_palette[color & 0xf];
+                        const uint8_t bg = textmode_palette[color >> 4];
+                        #pragma GCC unroll(8)
+                        for (int bit = 8; bit--;) {
+                            *output_buffer++ = (glyph_pixels & 1) ? fg : bg;
                             glyph_pixels >>= 1;
                         }
                     }
                 }
                 break;
+            }   
+            case TEXTMODE_80x25_COLOR: {
+                if (!in_text_area) {
+                    memset(output_buffer, 0, 640);
+                    break;
+                }
+                const uint8_t y_div_16 = y >> 4;         // 0-24 text rows (25 rows total)
+                const uint8_t glyph_line = y & 15;       // 0-15 font rows
+
+                const uint32_t *text_buffer_line = &VIDEORAM[0x8000 + (vram_offset << 1) + 
+                                                                __fast_mul(y_div_16, 160)];
+
+                for (unsigned int column = 0; column < TEXTMODE_COLS; column++) {
+                    uint8_t glyph_pixels = font_8x16[__fast_mul(*text_buffer_line++ & 0xFF, 16) + glyph_line];
+                    const uint8_t color = *text_buffer_line++;
+                    
+                    if (color & 0x80 && cursor_blink_state) {
+                        glyph_pixels = 0;
+                    }
+                    
+                    const uint8_t cursor_active = cursor_blink_state &&
+                        y_div_16 == CURSOR_Y && column == CURSOR_X &&
+                        glyph_line >= 14;  // Cursor on bottom 2 rows (14-15)
+                    
+                    if (cursor_active) {
+                        const uint8_t cursor_color = textmode_palette[color & 0xf];
+                        #pragma GCC unroll(8)
+                        for (int i = 0; i < 8; i++) {
+                            *output_buffer++ = cursor_color;
+                        }
+                    } else if (cga_blinking && (color & 0x80)) {
+                        const uint8_t fg = textmode_palette[color & 0xf];
+                        const uint8_t bg = textmode_palette[color >> 4 & 0x7];
+                        #pragma GCC unroll(8)
+                        for (int bit = 8; bit--;) {
+                            *output_buffer++ = cursor_blink_state ? bg
+                                : (glyph_pixels & 1) ? fg : bg;
+                            glyph_pixels >>= 1;
+                        }
+                    } else {
+                        const uint8_t fg = textmode_palette[color & 0xf];
+                        const uint8_t bg = textmode_palette[color >> 4];
+                        #pragma GCC unroll(8)
+                        for (int bit = 8; bit--;) {
+                            *output_buffer++ = (glyph_pixels & 1) ? fg : bg;
+                            glyph_pixels >>= 1;
+                        }
+                    }
+                }
+             break;
             }
             case CGA_320x200x4:
             case CGA_320x200x4_BW: {
+                if (!in_text_area) {
+                    memset(output_buffer, 0, 640);
+                    break;
+                }
                 const register uint32_t *cga_row = &VIDEORAM[0x8000 + (vram_offset << 1) + __fast_mul(y >> 1, 80) + ((y & 1) << 13)];
-                //2bit buf
+                //2bit buf with pixel doubling for VGA timing
                 for (int x = 320 / 4; x--;) {
                     const uint8_t cga_byte = *cga_row++;
 
                     uint8_t color = cga_byte >> 6;
                     *output_buffer++ = color;
+                    *output_buffer++ = color;  // Pixel doubling
                     color = (cga_byte >> 4) & 3;
                     *output_buffer++ = color;
+                    *output_buffer++ = color;  // Pixel doubling
                     color = (cga_byte >> 2) & 3;
                     *output_buffer++ = color;
+                    *output_buffer++ = color;  // Pixel doubling
                     color = (cga_byte >> 0) & 3;
                     *output_buffer++ = color;
+                    *output_buffer++ = color;  // Pixel doubling
                 }
                 break;
             }
             case COMPOSITE_160x200x16_force:
             case COMPOSITE_160x200x16:
             case TGA_160x200x16: {
+                if (!in_text_area) {
+                    memset(output_buffer, 0, 640);
+                    break;
+                }
                 const register uint32_t *tga_row = &VIDEORAM[tga_offset + __fast_mul(y >> 1, 80) + ((y & 1) << 13)];
                 uint32_t *output_buffer32 = (uint32_t *)output_buffer;
                 for (int x = 320 / 4; x--;) {
@@ -311,70 +418,133 @@ static void __time_critical_func() hdmi_scanline_interrupt_handler() {
             }
 
             case TGA_320x200x16: {
-                //4bit buf
+                if (!in_text_area) {
+                    memset(output_buffer, 0, 640);
+                    break;
+                }
+                //4bit buf with pixel doubling
                 const register uint32_t *tga_row = &VIDEORAM[tga_offset + (y & 3) * 8192 + __fast_mul(y >> 2, 160)];
                 for (int x = 320 / 2; x--;) {
                     const uint8_t two_pixels = *tga_row++; // Fetch 2 pixels from TGA memory
-                    *output_buffer++ = two_pixels >> 4;
-                    *output_buffer++ = two_pixels & 15;
+                    uint8_t pixel1 = two_pixels >> 4;
+                    uint8_t pixel2 = two_pixels & 15;
+                    *output_buffer++ = pixel1;
+                    *output_buffer++ = pixel1;  // Pixel doubling
+                    *output_buffer++ = pixel2;
+                    *output_buffer++ = pixel2;  // Pixel doubling
                 }
                 break;
             }
             case EGA_320x200x16x4: {
+                if (!in_text_area) {
+                    memset(output_buffer, 0, 640);
+                    break;
+                }
                 const register uint32_t *ega_row = &VIDEORAM[__fast_mul(y, 40)];
 
-                // Process 40 dwords (320 pixels) in groups
+                // Process 40 dwords (320 pixels) with pixel doubling
                 for (int x = 0; x < 40; x++) {
                     const uint32_t ega_planes = *ega_row++;
 
                     // Build 8 color nibbles packed into a 32-bit word
                     const uint32_t eight_pixels = ega_pack8_from_planes(ega_planes);
 
-                    // Unroll writing 8 pixels, duplicating horizontally
-                    *output_buffer++ = eight_pixels >> 28;
-                    *output_buffer++ = eight_pixels >> 24 & 0xF;
-                    *output_buffer++ = eight_pixels >> 20 & 0xF;
-                    *output_buffer++ = eight_pixels >> 16 & 0xF;
-                    *output_buffer++ = eight_pixels >> 12 & 0xF;
-                    *output_buffer++ = eight_pixels >> 8 & 0xF;
-                    *output_buffer++ = eight_pixels >> 4 & 0xF;
-                    *output_buffer++ = eight_pixels & 0xF;
+                    // Unroll writing 8 pixels with horizontal doubling (16 pixels output)
+                    uint8_t px = eight_pixels >> 28;
+                    *output_buffer++ = px;
+                    *output_buffer++ = px;
+                    px = eight_pixels >> 24 & 0xF;
+                    *output_buffer++ = px;
+                    *output_buffer++ = px;
+                    px = eight_pixels >> 20 & 0xF;
+                    *output_buffer++ = px;
+                    *output_buffer++ = px;
+                    px = eight_pixels >> 16 & 0xF;
+                    *output_buffer++ = px;
+                    *output_buffer++ = px;
+                    px = eight_pixels >> 12 & 0xF;
+                    *output_buffer++ = px;
+                    *output_buffer++ = px;
+                    px = eight_pixels >> 8 & 0xF;
+                    *output_buffer++ = px;
+                    *output_buffer++ = px;
+                    px = eight_pixels >> 4 & 0xF;
+                    *output_buffer++ = px;
+                    *output_buffer++ = px;
+                    px = eight_pixels & 0xF;
+                    *output_buffer++ = px;
+                    *output_buffer++ = px;
                 }
                 break;
             }
             case VGA_320x200x256x4: {
+                if (!in_text_area) {
+                    memset(output_buffer, 0, 640);
+                    break;
+                }
                 const register uint32_t *vga_row = &VIDEORAM[__fast_mul(y, 80)];
-                uint32_t *output_buffer32 = (uint32_t *)output_buffer;
+                // Each byte contains one pixel, need to double each pixel
                 for (int x = 0; x < 80; x++) {
-                    *output_buffer32++ = *vga_row++;
+                    uint32_t four_pixels = *vga_row++;  // 4 pixels
+                    // Extract and double each pixel
+                    uint8_t p0 = four_pixels & 0xFF;
+                    uint8_t p1 = (four_pixels >> 8) & 0xFF;
+                    uint8_t p2 = (four_pixels >> 16) & 0xFF;
+                    uint8_t p3 = (four_pixels >> 24) & 0xFF;
+                    *output_buffer++ = p0;
+                    *output_buffer++ = p0;
+                    *output_buffer++ = p1;
+                    *output_buffer++ = p1;
+                    *output_buffer++ = p2;
+                    *output_buffer++ = p2;
+                    *output_buffer++ = p3;
+                    *output_buffer++ = p3;
                 }
                 break;
             }
             case VGA_320x200x256:
             default: {
+                if (!in_text_area) {
+                    memset(output_buffer, 0, 640);
+                    break;
+                }
                 const uint32_t *vga_row = &VIDEORAM[__fast_mul(y, 320)];
+                // Pixel doubling: each pixel written twice
                 for (int x = 320; x--;) {
                     const uint8_t color = *vga_row++ & 0xFF;
-                    *output_buffer++ = color >= HDMI_CTRL_BASE_INDEX ? 0 : color;
+                    uint8_t pixel = color >= HDMI_CTRL_BASE_INDEX ? 0 : color;
+                    *output_buffer++ = pixel;
+                    *output_buffer++ = pixel;  // Pixel doubling
                 }
                 break;
             }
         }
 
-        // HSYNC
-        memset(current_scanline_buffer,      HDMI_CTRL_BASE_INDEX + 1, 48); // Back porch
-        memset(current_scanline_buffer + 48, HDMI_CTRL_BASE_INDEX,     24); // Sync pulse
-        memset(current_scanline_buffer + 392,HDMI_CTRL_BASE_INDEX,      8); // Front porch
+        // H-sync signal for visible lines (VGA standard timings)
+        // VGA 640x480 timing: Front porch 16, Sync 96, Back porch 48, Active 640
+        // Buffer layout: [Front 16][Sync 96][Back 48][Active 640] = 800 total
+        memset(current_scanline_buffer, HDMI_CTRL_BASE_INDEX + 1, 16);   // Front porch: 16 (H Inactive, V Inactive)
+        memset(current_scanline_buffer + 16, HDMI_CTRL_BASE_INDEX + 0, 96);   // H-sync: 96 (H Active, V Inactive)
+        memset(current_scanline_buffer + 16 + 96, HDMI_CTRL_BASE_INDEX + 1, 48); // Back porch: 48 (H Inactive, V Inactive)
     } else {
-        // VSYNC is active during scanlines 490-491 (vertical blanking period)
-        if (current_scanline >= 490 && current_scanline < 492) {
-            memset(current_scanline_buffer,     HDMI_CTRL_BASE_INDEX + 3,  48); // Back porch (VSYNC active)
-            memset(current_scanline_buffer + 48,HDMI_CTRL_BASE_INDEX + 2, 352); // Extended sync during VSYNC
+        // VSYNC/blanking - VGA timing: 480 active, 10 front, 2 vsync, 33 back = 525 total
+        const uint16_t scanline_width = 800;  // Always 800 for VGA timing
+        const uint16_t vsync_start = 490;  // 480 active + 10 front porch
+        const uint16_t vsync_end = 492;    // vsync_start + 2 vsync lines
+        
+        if (current_scanline >= vsync_start && current_scanline < vsync_end) {
+            // VSync Active
+            memset(current_scanline_buffer, HDMI_CTRL_BASE_INDEX + 3, 16); // Front: H Inactive, V Active
+            memset(current_scanline_buffer + 16, HDMI_CTRL_BASE_INDEX + 2, 96); // Sync: H Active, V Active
+            memset(current_scanline_buffer + 16 + 96, HDMI_CTRL_BASE_INDEX + 3, 48); // Back: H Inactive, V Active
+            memset(current_scanline_buffer + 16 + 96 + 48, HDMI_CTRL_BASE_INDEX + 3, 640); // Rest: H Inactive, V Active
         } else {
-            // HSYNC when blank lines
-            memset(current_scanline_buffer,     HDMI_CTRL_BASE_INDEX + 1, 48); // Back porch
-            memset(current_scanline_buffer + 48, HDMI_CTRL_BASE_INDEX,   352); // Blanking + sync
-        };
+            // VSync Inactive (Blanking)
+            memset(current_scanline_buffer, HDMI_CTRL_BASE_INDEX + 1, 16); // Front: H Inactive, V Inactive
+            memset(current_scanline_buffer + 16, HDMI_CTRL_BASE_INDEX + 0, 96); // Sync: H Active, V Inactive
+            memset(current_scanline_buffer + 16 + 96, HDMI_CTRL_BASE_INDEX + 1, 48); // Back: H Inactive, V Inactive
+            memset(current_scanline_buffer + 16 + 96 + 48, HDMI_CTRL_BASE_INDEX + 1, 640); // Rest: H Inactive, V Inactive
+        }
     }
 }
 
@@ -390,9 +560,9 @@ static inline void install_dma_interrupt_handler() {
     irq_set_enabled(VIDEO_DMA_IRQ, true);
 }
 
-//деинициализация - инициализация ресурсов
+// Initialize HDMI output resources
 static inline bool initialize_hdmi_output() {
-    //выключение прерывания DMA
+    // Disable DMA interrupt
     if (VIDEO_DMA_IRQ == DMA_IRQ_0) {
         dma_channel_set_irq0_enabled(dma_channel_control, false);
     } else {
@@ -407,7 +577,12 @@ static inline bool initialize_hdmi_output() {
 
     while (dma_hw->abort) tight_loop_contents();
 
-    //выключение SM основной и конвертора
+    // Disable state machines
+
+#if ZERO2
+    pio_set_gpio_base(PIO_VIDEO, 16);
+    pio_set_gpio_base(PIO_VIDEO_ADDR, 16);
+#endif
 
     //pio_sm_restart(PIO_VIDEO, SM_video);
     pio_sm_set_enabled(PIO_VIDEO, sm_video_output, false);
@@ -415,8 +590,7 @@ static inline bool initialize_hdmi_output() {
     //pio_sm_restart(PIO_VIDEO_ADDR, SM_conv);
     pio_sm_set_enabled(PIO_VIDEO_ADDR, sm_address_converter, false);
 
-
-    //удаление программ из соответствующих PIO
+    // Remove PIO programs
     pio_remove_program(PIO_VIDEO_ADDR, &pio_program_address_converter, pio_program_offset_converter);
     pio_remove_program(PIO_VIDEO, &pio_program_hdmi_output, pio_program_offset_video);
 
@@ -426,7 +600,7 @@ static inline bool initialize_hdmi_output() {
 
     pio_set_x_register(PIO_VIDEO_ADDR, sm_address_converter, (uint32_t) tmds_palette_buffer >> 12);
 
-    // 251-255 служебные данные(синхра) напрямую вносим в массив -конвертер
+    // Setup control symbols (251-255) for sync signals
     uint64_t *tmds_buffer_64 = (uint64_t *) tmds_palette_buffer;
     const uint16_t ctrl_symbol_0 = 0b1101010100;
     const uint16_t ctrl_symbol_1 = 0b0010101011;
@@ -435,23 +609,23 @@ static inline bool initialize_hdmi_output() {
 
     const int base_index = HDMI_CTRL_BASE_INDEX;
 
-    // H-sync low, V-sync low
-    tmds_buffer_64[2 * base_index + 0] = generate_hdmi_differential_data(ctrl_symbol_0, ctrl_symbol_0, ctrl_symbol_3);
-    tmds_buffer_64[2 * base_index + 1] = generate_hdmi_differential_data(ctrl_symbol_0, ctrl_symbol_0, ctrl_symbol_3);
+    // base_index + 0: H Active (0), V Inactive (1) -> Symbol 2 (0, 1)
+    tmds_buffer_64[2 * base_index + 0] = generate_hdmi_differential_data(ctrl_symbol_0, ctrl_symbol_0, ctrl_symbol_2);
+    tmds_buffer_64[2 * base_index + 1] = generate_hdmi_differential_data(ctrl_symbol_0, ctrl_symbol_0, ctrl_symbol_2);
 
-    // H-sync high, V-sync low
-    tmds_buffer_64[2 * (base_index + 1) + 0] = generate_hdmi_differential_data(ctrl_symbol_0, ctrl_symbol_0, ctrl_symbol_2);
-    tmds_buffer_64[2 * (base_index + 1) + 1] = generate_hdmi_differential_data(ctrl_symbol_0, ctrl_symbol_0, ctrl_symbol_2);
+    // base_index + 1: H Inactive (1), V Inactive (1) -> Symbol 3 (1, 1)
+    tmds_buffer_64[2 * (base_index + 1) + 0] = generate_hdmi_differential_data(ctrl_symbol_0, ctrl_symbol_0, ctrl_symbol_3);
+    tmds_buffer_64[2 * (base_index + 1) + 1] = generate_hdmi_differential_data(ctrl_symbol_0, ctrl_symbol_0, ctrl_symbol_3);
 
-    // H-sync low, V-sync high
-    tmds_buffer_64[2 * (base_index + 2) + 0] = generate_hdmi_differential_data(ctrl_symbol_0, ctrl_symbol_0, ctrl_symbol_1);
-    tmds_buffer_64[2 * (base_index + 2) + 1] = generate_hdmi_differential_data(ctrl_symbol_0, ctrl_symbol_0, ctrl_symbol_1);
+    // base_index + 2: H Active (0), V Active (0) -> Symbol 0 (0, 0)
+    tmds_buffer_64[2 * (base_index + 2) + 0] = generate_hdmi_differential_data(ctrl_symbol_0, ctrl_symbol_0, ctrl_symbol_0);
+    tmds_buffer_64[2 * (base_index + 2) + 1] = generate_hdmi_differential_data(ctrl_symbol_0, ctrl_symbol_0, ctrl_symbol_0);
 
-    // H-sync high, V-sync high
-    tmds_buffer_64[2 * (base_index + 3) + 0] = generate_hdmi_differential_data(ctrl_symbol_0, ctrl_symbol_0, ctrl_symbol_0);
-    tmds_buffer_64[2 * (base_index + 3) + 1] = generate_hdmi_differential_data(ctrl_symbol_0, ctrl_symbol_0, ctrl_symbol_0);
+    // base_index + 3: H Inactive (1), V Active (0) -> Symbol 1 (1, 0)
+    tmds_buffer_64[2 * (base_index + 3) + 0] = generate_hdmi_differential_data(ctrl_symbol_0, ctrl_symbol_0, ctrl_symbol_1);
+    tmds_buffer_64[2 * (base_index + 3) + 1] = generate_hdmi_differential_data(ctrl_symbol_0, ctrl_symbol_0, ctrl_symbol_1);
 
-    //настройка PIO SM для конвертации
+    // Configure PIO state machine for conversion
 
     pio_sm_config config = pio_get_default_sm_config();
     sm_config_set_wrap(&config, pio_program_offset_converter, pio_program_offset_converter + (pio_program_address_converter.length - 1));
@@ -460,11 +634,10 @@ static inline bool initialize_hdmi_output() {
     pio_sm_init(PIO_VIDEO_ADDR, sm_address_converter, pio_program_offset_converter, &config);
     pio_sm_set_enabled(PIO_VIDEO_ADDR, sm_address_converter, true);
 
-    //настройка PIO SM для вывода данных
+    // Configure PIO state machine for video output
     config = pio_get_default_sm_config();
     sm_config_set_wrap(&config, pio_program_offset_video, pio_program_offset_video + (pio_program_hdmi_output.length - 1));
 
-    //настройка side set
     sm_config_set_sideset_pins(&config,HDMI_PIN_CLOCK);
     sm_config_set_sideset(&config, 2,false,false);
 
@@ -474,9 +647,17 @@ static inline bool initialize_hdmi_output() {
         gpio_set_slew_rate(HDMI_PIN_CLOCK + i, GPIO_SLEW_RATE_FAST);
     }
 
+#if ZERO2
+    pio_sm_set_consecutive_pindirs(PIO_VIDEO, sm_video_output, HDMI_BASE_PIN, 8, true);
+    pio_sm_set_consecutive_pindirs(PIO_VIDEO_ADDR, sm_address_converter, HDMI_BASE_PIN, 8, true);
+
+    uint64_t mask64 = (uint64_t)(3u << HDMI_PIN_CLOCK);
+    pio_sm_set_pins_with_mask64(PIO_VIDEO, sm_video_output, mask64, mask64);
+    pio_sm_set_pindirs_with_mask64(PIO_VIDEO, sm_video_output, mask64, mask64);
+#else    
     pio_sm_set_pins_with_mask(PIO_VIDEO, sm_video_output, 3u << HDMI_PIN_CLOCK, 3u << HDMI_PIN_CLOCK);
     pio_sm_set_pindirs_with_mask(PIO_VIDEO, sm_video_output, 3u << HDMI_PIN_CLOCK, 3u << HDMI_PIN_CLOCK);
-    //пины
+#endif
 
     for (int i = 0; i < 6; i++) {
         pio_gpio_init(PIO_VIDEO, HDMI_PIN_DATA + i);
@@ -484,22 +665,30 @@ static inline bool initialize_hdmi_output() {
         gpio_set_slew_rate(HDMI_PIN_DATA + i, GPIO_SLEW_RATE_FAST);
     }
     pio_sm_set_consecutive_pindirs(PIO_VIDEO, sm_video_output, HDMI_PIN_DATA, 6, true);
-    //конфигурация пинов на выход
     sm_config_set_out_pins(&config, HDMI_PIN_DATA, 6);
 
-    //
     sm_config_set_out_shift(&config, true, true, 30);
     sm_config_set_fifo_join(&config, PIO_FIFO_JOIN_TX);
 
+    // PIO clock divider calculation for 640x480@60Hz VGA timing:
+    // - Target TMDS bit clock: 252 MHz (10× pixel clock)
+    // - Pixel clock: 25.2 MHz (standard VGA 640x480@60Hz)
+    // - PIO program: 10 instructions per pixel, each outputting 6 bits
+    // - Each pixel requires 64 bits (2× 32-bit words with autopull at 30 bits)
+    // - If clk_sys = 504 MHz: clkdiv = 504/252 = 2.0, PIO clock = 252 MHz ✓
+    // - If clk_sys = 378 MHz: clkdiv = 378/252 = 1.5, PIO clock = 252 MHz ✓
     sm_config_set_clkdiv(&config, clock_get_hz(clk_sys) / 252000000.0f);
     pio_sm_init(PIO_VIDEO, sm_video_output, pio_program_offset_video, &config);
     pio_sm_set_enabled(PIO_VIDEO, sm_video_output, true);
 
-    //настройки DMA
+    // Configure DMA buffers
     scanline_buffers[0] = &tmds_palette_buffer[1024];
-    scanline_buffers[1] = &tmds_palette_buffer[1124];
+    scanline_buffers[1] = &tmds_palette_buffer[1224];
 
-    //основной рабочий канал
+    // VGA timing requires 800 pixels per scanline for proper sync timing
+    int scanline_transfer_count = 800;
+
+    // Configure primary data channel
     dma_channel_config dma_config = dma_channel_get_default_config(dma_channel_data);
     channel_config_set_transfer_data_size(&dma_config, DMA_SIZE_8);
     channel_config_set_chain_to(&dma_config, dma_channel_control); // chain to other channel
@@ -516,11 +705,11 @@ static inline bool initialize_hdmi_output() {
         &dma_config,
         &PIO_VIDEO_ADDR->txf[sm_address_converter], // Write address
         &scanline_buffers[0][0], // read address
-        400, //
+        scanline_transfer_count,
         false // Don't start yet
     );
 
-    //контрольный канал для основного
+    // Configure control channel
     dma_config = dma_channel_get_default_config(dma_channel_control);
     channel_config_set_transfer_data_size(&dma_config, DMA_SIZE_32);
     channel_config_set_chain_to(&dma_config, dma_channel_data); // chain to other channel
@@ -540,7 +729,7 @@ static inline bool initialize_hdmi_output() {
         false // Don't start yet
     );
 
-    //канал - конвертер палитры
+    // Configure palette conversion channel
 
     dma_config = dma_channel_get_default_config(dma_channel_palette_data);
     channel_config_set_transfer_data_size(&dma_config, DMA_SIZE_32);
@@ -559,11 +748,11 @@ static inline bool initialize_hdmi_output() {
         &dma_config,
         &PIO_VIDEO->txf[sm_video_output], // Write address
         &tmds_palette_buffer[0], // read address
-        4, //
+        2, // Transfer only 2× 32-bit words (one 64-bit pixel), skip the duplicated pixel
         false // Don't start yet
     );
 
-    //канал управления конвертером палитры
+    // Configure palette control channel
 
     dma_config = dma_channel_get_default_config(dma_channel_palette_control);
     channel_config_set_transfer_data_size(&dma_config, DMA_SIZE_32);
@@ -586,7 +775,7 @@ static inline bool initialize_hdmi_output() {
         true // start yet
     );
 
-    //стартуем прерывание и канал
+    // Enable DMA interrupt and start channel
     if (VIDEO_DMA_IRQ == DMA_IRQ_0) {
         dma_channel_acknowledge_irq0(dma_channel_control);
         dma_channel_set_irq0_enabled(dma_channel_control, true);
@@ -602,20 +791,21 @@ static inline bool initialize_hdmi_output() {
     return true;
 }
 
-//выбор видеорежима
 void graphics_set_mode(enum graphics_mode_t mode) {
     graphics_mode = mode;
 }
 
 void graphics_set_palette(const uint8_t index, const uint32_t color888) {
-    if (index >= HDMI_CTRL_BASE_INDEX) return; //не записываем "служебные" цвета
+    if (index >= HDMI_CTRL_BASE_INDEX) return; // Don't overwrite control symbols
 
     uint64_t *tmds_color = (uint64_t *) tmds_palette_buffer + index * 2;
     const uint8_t R = (color888 >> 16) & 0xff;
     const uint8_t G = (color888 >> 8) & 0xff;
     const uint8_t B = (color888 >> 0) & 0xff;
     tmds_color[0] = generate_hdmi_differential_data(tmds_encode_8b10b(R), tmds_encode_8b10b(G), tmds_encode_8b10b(B));
-    tmds_color[1] = tmds_color[0] ^ 0x0003ffffffffffffl;
+    // Invert all 60 data bits (2x30 bits) for DC balance
+    // Mask: 0x3FFFFFFF3FFFFFFF (30 ones, 2 zeros, 30 ones)
+    tmds_color[1] = tmds_color[0] ^ 0x3FFFFFFF3FFFFFFFULL;
 }
 
 void graphics_set_buffer(uint8_t *buffer, const uint16_t width, const uint16_t height) {
@@ -624,10 +814,8 @@ void graphics_set_buffer(uint8_t *buffer, const uint16_t width, const uint16_t h
     framebuffer_height = height;
 }
 
-
-//выделение и настройка общих ресурсов - 4 DMA канала, PIO программ и 2 SM
 void graphics_init() {
-    //настройка PIO
+    // Claim PIO state machines
     sm_video_output = pio_claim_unused_sm(PIO_VIDEO, true);
     sm_address_converter = pio_claim_unused_sm(PIO_VIDEO_ADDR, true);
     //выделение и преднастройка DMA каналов
@@ -639,8 +827,8 @@ void graphics_init() {
     initialize_hdmi_output();
 }
 
-void graphics_set_bgcolor(uint32_t color888) //определяем зарезервированный цвет в палитре
-{
+void graphics_set_bgcolor(uint32_t color888) {
+
     graphics_set_palette(255, color888);
 }
 
