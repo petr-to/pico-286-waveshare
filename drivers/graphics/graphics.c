@@ -15,7 +15,7 @@ void draw_window(const char title[2*TEXTMODE_COLS + 1], uint32_t x, uint32_t y, 
     memset(line, 0, sizeof line);
     width--;
     height--;
-    // Рисуем рамки
+    // Draw borders
 
     memset(line, 0xCD, width); // ═══
 

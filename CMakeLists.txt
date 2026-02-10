@@ -14,20 +14,56 @@ if (EXISTS ${picoVscode})
 endif()
 # ====================================================================================
 endif()
+set(PICO_BOARD pico CACHE STRING "Board type")
 cmake_minimum_required(VERSION 3.13)
+
+option(ZERO "RP2040-PiZero" OFF)
+option(ZERO2 "RP2350-PiZero" OFF)
+
+#set(MURM20 ON)
+#set(m1p2launcher ON)
+#set (ZERO2 OFF)
+
+#set(KBDUSB OFF)
+add_compile_options(-w)
 
 set(CMAKE_C_STANDARD 17)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # Pull in Raspberry Pi Pico SDK (must be before project, but after PICO_BOARD)
-include($ENV{PICO_SDK_PATH}/external/pico_sdk_import.cmake)
+IF(ZERO2)
+    # For Board RP2350-PiZero
+
+    set(PICO_BOARD_HEADER_DIRS ${CMAKE_SOURCE_DIR}/src/boards)
+    set(PICO_BOARD waveshare_rp2350_pizero)
+    set(PICO_PLATFORM rp2350-arm-s)
+    set(ENABLE_HDMI ON)
+    set(KBDUSB ON)
+   # set(PICO_BOARD pico2)
+#    set(CPU_MHZ 252)
+    include($ENV{PICO_SDK_PATH}/external/pico_sdk_import.cmake)
+elseif(ZERO)
+    set(PICO_BOARD pico)
+    include($ENV{PICO_SDK_PATH}/external/pico_sdk_import.cmake)
+    #set(CPU_MHZ 252)
+endif()
+
+
 
 project(286 C CXX ASM)
-SET(BUILD_NAME "${PROJECT_NAME}")
+IF(MURM2)
+    SET(BUILD_NAME "m2${PROJECT_NAME}")
+    set (BUTTER_PSRAM_GPIO 8)
+ELSEIF(ZERO)
+    SET(BUILD_NAME "z0${PROJECT_NAME}")
+ELSEIF(ZERO2)
+    SET(BUILD_NAME "z0${PROJECT_NAME}")
+    set (BUTTER_PSRAM_GPIO 47)
+ELSE()    
+    SET(BUILD_NAME "${PROJECT_NAME}")
+ENDIF()
 
-#set(MURM20 ON)
-#set(m1p2launcher ON)
 # CPU Configuration
 set(CPU_FREQ_MHZ "500")
 set(FLASH_FREQ_MHZ "100")
@@ -78,6 +114,14 @@ else ()
     pico_sdk_init()
 
     # =========================
+    # PIO-USB LIBRARY
+    # =========================
+    if(KBDUSB)
+        add_subdirectory(drivers/pio-usb)
+        message(STATUS "PIO-USB enabled for USB keyboard support")
+    endif()
+
+    # =========================
     # BUILD OPTIONS
     # =========================
 
@@ -111,8 +155,10 @@ else ()
             set(CPU_FREQ_MHZ "504")
             message(STATUS "HDMI enabled - CPU frequency locked to 504 MHz")
         else ()
-            set(CPU_FREQ_MHZ "504")
+            set(CPU_FREQ_MHZ "378")
             message(STATUS "HDMI enabled - CPU frequency locked to 378 MHz")
+             message(STATUS ${PICO_BOARD})
+             message(STATUS "Zero2 " ${ZERO2})
         endif ()
 
         math(EXPR DISPLAY_COUNT "${DISPLAY_COUNT} + 1")
@@ -220,7 +266,7 @@ else ()
     if (PICO_PLATFORM STREQUAL "rp2040")
         add_subdirectory(memops_opt)
         target_link_libraries(${PROJECT_NAME} PRIVATE memops_opt)
-        target_compile_definitions(slower_boot2 PRIVATE PICO_FLASH_SPI_CLKDIV=4)
+        target_compile_definitions(slower_boot2 PRIVATE PICO_FLASH_SPI_CLKDIV=2)  # Optimized from 4 for faster boot
     else ()
         if (m1p2launcher)
             if (MURM20)
@@ -244,12 +290,23 @@ else ()
     # =========================
     # SUBDIRECTORIES
     # =========================
+IF(KBDUSB)
+    add_subdirectory(drivers/usbhid)
+    # Note: ps2kbd is not needed for USB keyboard mode
+    # add_subdirectory(drivers/ps2kbd)
+    target_link_libraries(${PROJECT_NAME} PRIVATE usbhid)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE KBDUSB)
+ELSE()
     add_subdirectory(drivers/ps2)
+    target_link_libraries(${PROJECT_NAME} PRIVATE ps2)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE KBDPS2)
+ENDIF()
+
     add_subdirectory(drivers/fatfs)
     add_subdirectory(drivers/sdcard)
     add_subdirectory(drivers/audio)
     add_subdirectory(drivers/psram)
-    add_subdirectory(drivers/nespad)
+    # add_subdirectory(drivers/nespad)
 
     # Display drivers
     if (ENABLE_TFT)
@@ -275,12 +332,20 @@ else ()
     # =========================
     # LIBRARIES
     # =========================
+    if(KBDUSB)
+        set(USB_LIBS pico_pio_usb tinyusb_host tinyusb_board)
+    else()
+        set(USB_LIBS tinyusb_host tinyusb_board)
+    endif()
+
     target_link_libraries(${PROJECT_NAME} PRIVATE
-            ps2 sdcard audio graphics nespad psram
+            sdcard audio graphics psram
             pico_runtime pico_stdlib pico_multicore
             hardware_dma hardware_pio hardware_i2c hardware_exception
             hardware_interp hardware_timer hardware_clocks hardware_pwm hardware_flash
             -Wl,--wrap=atexit,--wrap=abort,--strip-all,--gc-sections # size optimizations
+
+            ${USB_LIBS}
     )
     pico_set_printf_implementation(${PROJECT_NAME} none)
 
@@ -309,6 +374,13 @@ else ()
 
             PSRAM
     )
+
+
+
+#if (BUTTER_PSRAM_GPIO)
+#    target_compile_definitions(${PROJECT_NAME} PRIVATE BUTTER_PSRAM_GPIO=${BUTTER_PSRAM_GPIO})
+#endif()
+
     if (MURM20)
         target_compile_definitions(${PROJECT_NAME} PRIVATE
                 MURM2=1
@@ -323,6 +395,58 @@ else ()
                 CLOCK_PIN=27 PCM_PIN=22
                 PWM_BEEPER=9 PWM_LEFT_CHANNEL=10 PWM_RIGHT_CHANNEL=11
         )
+ELSEIF(ZERO2)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE
+        CPU_MHZ=${CPU_MHZ}
+        ZERO2=1
+
+        # PS2 keyboard (not used when KBDUSB is enabled)
+        KBD_CLOCK_PIN=2
+        KBD_DATA_PIN=3
+
+        # USB PIO pins for keyboard (GPIO 28=D+, GPIO 29=D-)
+        # Note: These are used by PIO-USB library
+        PIO_USB_DP_PIN=28
+        
+        PWM_PIN0=10
+        PWM_PIN1=11
+        BEEPER_PIN=12
+
+        # SDCARD
+        SDCARD_SPI_BUS=spi1
+        SDCARD_PIN_SPI0_SCK=30
+        SDCARD_PIN_SPI0_MOSI=31
+        SDCARD_PIN_SPI0_MISO=40
+        SDCARD_PIN_SPI0_CS=43
+
+     #   PSRAM
+        # PSRAM_MUTEX=1
+        PSRAM_SPINLOCK=0
+        PSRAM_ASYNC=1
+
+        PSRAM_PIN_CS=2
+        PSRAM_PIN_SCK=3
+        PSRAM_PIN_MOSI=4
+        PSRAM_PIN_MISO=5
+
+        # NES Gamepad
+        USE_NESPAD
+        NES_GPIO_CLK=14
+        NES_GPIO_LAT=15
+        NES_GPIO_DATA=17
+        NES_GPIO_DATA2=18
+
+        # VGA 8 pins starts from pin:
+        VGA_BASE_PIN=32
+
+        # HDMI 8 pins starts from pin:
+        HDMI_BASE_PIN=32
+
+        PICO_DEFAULT_LED_PIN=25
+
+        #PWM 
+        PWM_BEEPER=10 PWM_LEFT_CHANNEL=11 PWM_RIGHT_CHANNEL=12
+    )
     else ()
         target_compile_definitions(${PROJECT_NAME} PRIVATE
                 # Pin configurations

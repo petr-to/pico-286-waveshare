@@ -17,16 +17,22 @@ extern "C" {
 #define HDMI_BASE_PIN (6)
 #endif
 
-#define HDMI_PIN_invert_diffpairs (1)
-#define HDMI_PIN_RGB_notBGR (1)
-#define HDMI_PIN_DATA (HDMI_BASE_PIN+2)
-#define HDMI_PIN_CLOCK (HDMI_BASE_PIN)
+#if defined(ZERO) || defined(ZERO2)
+	#define HDMI_PIN_RGB_notBGR (0)
+	#define HDMI_PIN_invert_diffpairs (0)
+	#define HDMI_PIN_DATA (HDMI_BASE_PIN)
+	#define HDMI_PIN_CLOCK (HDMI_BASE_PIN + 6)
+#else
+	#define HDMI_PIN_RGB_notBGR (1)
+	#define HDMI_PIN_invert_diffpairs (1)
+	#define HDMI_PIN_CLOCK (HDMI_BASE_PIN)
+	#define HDMI_PIN_DATA (HDMI_BASE_PIN+2)
+#endif
 
+#define SCREEN_WIDTH (640)
+#define SCREEN_HEIGHT (480)
 
-#define SCREEN_WIDTH (320)
-#define SCREEN_HEIGHT (240)
-
-#define TEXTMODE_COLS (SCREEN_WIDTH/4)
+#define TEXTMODE_COLS (SCREEN_WIDTH/8)
 #define TEXTMODE_ROWS (SCREEN_HEIGHT/6)
 
 #define RGB888(r, g, b) ((r<<16) | (g << 8 ) | b )

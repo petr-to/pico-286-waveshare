@@ -79,7 +79,7 @@ extern uint32_t VIDEORAM[VIDEORAM_SIZE];
 extern uint8_t UMB[UMB_END - UMB_START];
 extern uint8_t HMA[HMA_END - HMA_START];
 // for non-butter-psram modes
-#define SRAM_BLOCK_SIZE 0x2C000
+#define SRAM_BLOCK_SIZE 0x29800 // 168 KB  to free more momory for video buffer
 extern uint8_t SRAM[SRAM_BLOCK_SIZE];
 #define FIRST_RAM_PAGE (butter_psram_size ? RAM : SRAM)
 
@@ -108,11 +108,11 @@ typedef union {
         unsigned _15 : 1;
         unsigned _16 : 1;
         unsigned _17 : 1;
-        unsigned AC : 1; // 18 (Alignment Check)	Проверка выравнивания (включается в CPL=3 при CR0.AM=1)
+        unsigned AC : 1; // 18 (Alignment Check) - Enabled in CPL=3 when CR0.AM=1
                          // (Alignment Check Exception) — INT 17 (11h)
-        unsigned VIF : 1; // 19 (Virtual Interrupt Flag)	Виртуальный IF для виртуализации (введён в 486, но зарезервирован с 386)
-        unsigned VIP : 1; // 20 (Virtual Interrupt Pending)	Виртуальное прерывание ожидает (аналогично — введён в 486)
-        unsigned ID : 1; // 21 (ID Flag)	Позволяет проверить поддержку CPUID инструкцией
+        unsigned VIF : 1; // 19 (Virtual Interrupt Flag) - Virtual IF for virtualization (introduced in 486, reserved since 386)
+        unsigned VIP : 1; // 20 (Virtual Interrupt Pending) - Virtual interrupt pending (introduced in 486)
+        unsigned ID : 1; // 21 (ID Flag) - Allows CPUID instruction support check
     } bits;
 } x86_flags_t;
 

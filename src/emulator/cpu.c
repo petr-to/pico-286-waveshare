@@ -67,9 +67,9 @@ __not_in_flash() void modregrm() {
     rm = addrbyte & 7;
 #ifdef CPU_386_EXTENDED_OPS
     if (addressSizeOverride) {
-        // 32-битный адрес
+        // 32-bit address mode
         if (mode != 3 && rm == 4) {
-            // SIB присутствует
+            // SIB byte present
             sib = getmem8(CPU_CS, CPU_IP);
             StepIP(1);
         }
@@ -134,11 +134,11 @@ __not_in_flash() void getea(uint8_t rmval) {
         addressSizeOverride = false;
         if (operandSizeOverride) {
             operandSizeOverride = false;
-            // Включена 32-битная адресация
+            // 32-bit addressing enabled
             if (mode == 0 && rmval == 6) {
-                tempea = disp32; // Используем 32-битный displacement
+                tempea = disp32; // Use 32-bit displacement
             } else {
-                // Если Mode не 0 или RM не 6, считаем по обычной схеме с SIB
+                // If Mode is not 0 or RM is not 6, calculate with SIB
                 switch (mode) {
                     case 0:
                         switch (rmval) {
@@ -183,14 +183,14 @@ __not_in_flash() void getea(uint8_t rmval) {
                         break;
                 }
             }
-            // Учитываем SIB, если нужно
+            // Handle SIB if needed
             if (rmval == 4 && mode != 3) {
-                // RM == 4 указывает на SIB
+                // RM == 4 indicates SIB
                 uint8_t sib_scale = sib >> 6;
                 uint8_t sib_index = (sib >> 3) & 7;
                 uint8_t sib_base = sib & 7;
                 uint32_t sib_value = 0;
-                // Определим базовый регистр
+                // Determine base register
                 switch (sib_base) {
                     case 0: sib_value = CPU_EBX;
                         break;
@@ -209,11 +209,11 @@ __not_in_flash() void getea(uint8_t rmval) {
                     case 7: sib_value = CPU_EDI;
                         break;
                 }
-                // Учитываем индекс (если есть)
+                // Handle index (if present)
                 if (sib_index != 4) {
-                    // если индекс не базовый (ESP, EBP и т.д.)
+                    // If index is not base (ESP, EBP, etc.)
                     uint32_t index_value = getreg32(sib_index);
-                    sib_value += (index_value << sib_scale); // Считываем с учётом масштаба
+                    sib_value += (index_value << sib_scale); // Calculate with scale
                 }
                 tempea += sib_value;
             }
@@ -267,11 +267,11 @@ __not_in_flash() void getea(uint8_t rmval) {
     }
     if (operandSizeOverride) {
         operandSizeOverride = false;
-        // Включена 32-битная адресация
+        // 32-bit addressing enabled
         if (mode == 0 && rmval == 6) {
-            tempea = disp32; // Используем 32-битный displacement
+            tempea = disp32; // Use 32-bit displacement
         } else {
-            // Если Mode не 0 или RM не 6, считаем по обычной схеме с SIB
+            // If Mode is not 0 or RM is not 6, calculate with SIB
             switch (mode) {
                 case 0:
                     switch (rmval) {
@@ -316,14 +316,14 @@ __not_in_flash() void getea(uint8_t rmval) {
                     break;
             }
         }
-        // Учитываем SIB, если нужно
+        // Handle SIB if needed
         if (rmval == 4 && mode != 3) {
-            // RM == 4 указывает на SIB
+            // RM == 4 indicates SIB
             uint8_t sib_scale = sib >> 6;
             uint8_t sib_index = (sib >> 3) & 7;
             uint8_t sib_base = sib & 7;
             uint32_t sib_value = 0;
-            // Определим базовый регистр
+            // Determine base register
             switch (sib_base) {
                 case 0: sib_value = CPU_BX;
                     break;
@@ -342,11 +342,11 @@ __not_in_flash() void getea(uint8_t rmval) {
                 case 7: sib_value = CPU_DI;
                     break;
             }
-            // Учитываем индекс (если есть)
+            // Handle index (if present)
             if (sib_index != 4) {
-                // если индекс не базовый (ESP, EBP и т.д.)
+                // If index is not base (ESP, EBP, etc.)
                 uint32_t index_value = getreg32(sib_index);
-                sib_value += (index_value << sib_scale); // Считываем с учётом масштаба
+                sib_value += (index_value << sib_scale); // Calculate with scale
             }
             tempea += sib_value;
         }

@@ -37,22 +37,22 @@ static unsigned int translate_key(KeySym keysym) {
         case XK_space: return 32;
         case XK_BackSpace: return 8;
         case XK_Tab: return 9;
-        case XK_Left: return 37;
-        case XK_Up: return 38;
-        case XK_Right: return 39;
-        case XK_Down: return 40;
-        case XK_F1: return 112;
-        case XK_F2: return 113;
-        case XK_F3: return 114;
-        case XK_F4: return 115;
-        case XK_F5: return 116;
-        case XK_F6: return 117;
-        case XK_F7: return 118;
-        case XK_F8: return 119;
-        case XK_F9: return 120;
-        case XK_F10: return 121;
-        case XK_F11: return 122;
-        case XK_F12: return 123;
+        case XK_Left: return 1000;
+        case XK_Up: return 1001;
+        case XK_Right: return 1002;
+        case XK_Down: return 1003;
+        case XK_F1: return 1004;
+        case XK_F2: return 1005;
+        case XK_F3: return 1006;
+        case XK_F4: return 1007;
+        case XK_F5: return 1008;
+        case XK_F6: return 1009;
+        case XK_F7: return 1010;
+        case XK_F8: return 1011;
+        case XK_F9: return 1012;
+        case XK_F10: return 1013;
+        case XK_F11: return 1014;
+        case XK_F12: return 1015;
         case XK_Shift_L: case XK_Shift_R: return 16;
         case XK_Control_L: case XK_Control_R: return 17;
         case XK_Alt_L: case XK_Alt_R: return 18;
@@ -65,7 +65,20 @@ static unsigned int translate_key(KeySym keysym) {
 }
 
 static void convert_buffer_to_image() {
-    if (!s_buffer || !s_image_data) return;
+    static int first_call = 1;
+    if (!s_buffer || !s_image_data) {
+        if (first_call) {
+            printf("convert_buffer_to_image: buffer=%p, image_data=%p\n", s_buffer, s_image_data);
+            first_call = 0;
+        }
+        return;
+    }
+    
+    if (first_call) {
+        uint32_t *src = (uint32_t *)s_buffer;
+        printf("convert_buffer_to_image: depth=%d, first pixel=0x%08x\n", s_depth, src[0]);
+        first_call = 0;
+    }
     
     uint32_t *src = (uint32_t *)s_buffer;
     
@@ -112,15 +125,19 @@ static void convert_buffer_to_image() {
 }
 
 int mfb_open(const char *title, int width, int height, int scale) {
+    printf("mfb_open: Opening display...\n");
     s_display = XOpenDisplay(NULL);
     if (!s_display) {
         fprintf(stderr, "Cannot open X display\n");
         return 0;
     }
     
+    printf("mfb_open: Display opened\n");
     s_screen = DefaultScreen(s_display);
     s_visual = DefaultVisual(s_display, s_screen);
     s_depth = DefaultDepth(s_display, s_screen);
+    
+    printf("mfb_open: Screen depth = %d\n", s_depth);
     
     s_width = width;
     s_height = height;
@@ -151,6 +168,8 @@ int mfb_open(const char *title, int width, int height, int scale) {
     
     XMapWindow(s_display, s_window);
     
+    printf("mfb_open: Window mapped\n");
+    
     s_gc = XCreateGC(s_display, s_window, 0, NULL);
     
     if (s_depth >= 24) {
@@ -170,10 +189,15 @@ int mfb_open(const char *title, int width, int height, int scale) {
         return 0;
     }
     
+    printf("mfb_open: XImage created\n");
+    
     memset(s_palette, 0, sizeof(s_palette));
     
     Atom wm_delete = XInternAtom(s_display, "WM_DELETE_WINDOW", False);
     XSetWMProtocols(s_display, s_window, &wm_delete, 1);
+    
+    printf("mfb_open: Window ready!\n");
+    XFlush(s_display);
     
     return 1;
 }
