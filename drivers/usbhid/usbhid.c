@@ -9,6 +9,9 @@
 #include "pio_usb.h"
 #endif
 
+// External emulator function for mouse events
+extern void sermouseevent(uint8_t buttons, int8_t xrel, int8_t yrel);
+
 #define GAMEPAD_MAX_DEVICES 2
 
 int nespad_state;
@@ -76,7 +79,7 @@ static const usb_to_xt conversion[] = {
     [ 15] = { "\x26"          , "\xa6"           }, // L
     [ 51] = { "\x27"          , "\xa7"           }, // ; :
     [ 52] = { "\x28"          , "\xa8"           }, // ' "
-    [ 50] = { "\x00"          , "\x80"           }, // non-US-1
+    [ 50] = { "\x2b"          , "\xab"           }, // non-US-1 (ISO backslash near left shift)
     [ 40] = { "\x1c"          , "\x9c"           }, // Enter
     [225] = { "\x2a"          , "\xaa"           }, // LShift
     [ 29] = { "\x2c"          , "\xac"           }, // Z
@@ -152,8 +155,9 @@ void keyboard_init(void) {
     // is complete (clocks, PSRAM, etc.)
     
     // Disable watchdog during USB init as it can take time
-    bool watchdog_was_enabled = watchdog_caused_reboot();
-    if (watchdog_was_enabled) {
+    // Note: We don't re-enable the watchdog after init as it's only used
+    // for one-shot soft reset (Ctrl+Alt+Del), not continuous monitoring
+    if (watchdog_caused_reboot()) {
         watchdog_disable();
     }
     
@@ -172,11 +176,6 @@ void keyboard_init(void) {
     if (!init_result) {
         // USB init failed - not fatal, keyboard just won't work
         // System should still boot
-    }
-    
-    // Re-enable watchdog if it was enabled
-    if (watchdog_was_enabled) {
-        watchdog_enable(0x7fffff, false);  // ~8 seconds
     }
 }
 
@@ -886,6 +885,10 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance, uint8_t const* desc_re
         case HID_ITF_PROTOCOL_KEYBOARD:
             break;
 
+        case HID_ITF_PROTOCOL_MOUSE:
+            // USB mouse detected and mounted
+            break;
+
         case HID_ITF_PROTOCOL_NONE:
             if (gamepads_count < GAMEPAD_MAX_DEVICES) {
                 gamepad_t* gamepad = &gamepads[gamepads_count];
@@ -924,6 +927,27 @@ void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance, uint8_t cons
             find_released_keys(kbd_report);
             memcpy(&prev_report, report, sizeof(hid_keyboard_report_t));
             break;
+
+        case HID_ITF_PROTOCOL_MOUSE: {
+            // Process USB mouse report
+            const hid_mouse_report_t *mouse_report = (const hid_mouse_report_t*)report;
+            
+            // Convert HID mouse buttons to emulator format
+            // HID: bit 0=left, bit 1=right, bit 2=middle
+            // Emulator expects: bit 0=right, bit 1=left
+            uint8_t buttons = 0;
+            if (mouse_report->buttons & MOUSE_BUTTON_LEFT) {
+                buttons |= 0x02;  // Left button -> bit 1
+            }
+            if (mouse_report->buttons & MOUSE_BUTTON_RIGHT) {
+                buttons |= 0x01;  // Right button -> bit 0
+            }
+            // Middle button could be mapped if needed
+            
+            // Send mouse event to emulator
+            sermouseevent(buttons, mouse_report->x, mouse_report->y);
+            break;
+        }
 
         case HID_ITF_PROTOCOL_NONE:
             process_gamepad_report(dev_addr, instance, report, len);
